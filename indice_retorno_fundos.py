@@ -212,67 +212,143 @@ def painel_diario(serie: pd.DataFrame, chaves_grupo: list[str]) -> tuple[pd.Data
 
 
 # --------------------------------------------------------------------------
-# Passos 2 a 4 -- retornos, pesos, índice do grupo
+# Passos 2 a 4 em Python -- SÓ para conferência no console/log.
+# O Excel NÃO usa estes números: lá tudo é fórmula viva (ver exportar_excel).
 # --------------------------------------------------------------------------
-def indice_do_grupo(cota: pd.DataFrame, pl: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    # Passo 1: retorno diário por fundo a partir da própria cota
-    ret = cota / cota.shift(1) - 1.0
-    # Passo 2 (insumo): PL do dia anterior = peso bruto
-    pl_ant = pl.shift(1)
-
-    # marca outliers e os remove do índice (viram NaN e não entram no peso)
-    outlier = ret.abs() > LIMITE_OUTLIER
-    ret_val = ret.mask(outlier)
-
-    # fundo entra no dia t só se tem retorno válido E PL_ant válido
+def indice_do_grupo(cota: pd.DataFrame, pl: pd.DataFrame) -> pd.DataFrame:
+    ret = cota / cota.shift(1) - 1.0                    # Passo 1
+    pl_ant = pl.shift(1)                                # insumo do peso
+    ret_val = ret.mask(ret.abs() > LIMITE_OUTLIER)      # tira outliers
     valido = ret_val.notna() & pl_ant.notna() & (pl_ant > 0)
-    pl_peso = pl_ant.where(valido)                      # PL_ant só onde o fundo é válido no dia
-    soma_pl = pl_peso.sum(axis=1)                       # Σ PL_ant do grupo, por dia
-    peso = pl_peso.div(soma_pl, axis=0)                 # Passo 2: w_i,t
-    contrib = peso * ret_val.where(valido)              # w_i,t * r_i,t
-    ret_grupo = contrib.sum(axis=1)                     # Passo 3: R_G,t
-    ret_grupo = ret_grupo.where(soma_pl > 0)            # dia sem nenhum fundo válido -> NaN
-
-    # Passo 4: índice encadeado base 100 a partir do 1º dia com retorno
-    r = ret_grupo.fillna(0.0)
-    idx = INDICE_BASE * (1.0 + r).cumprod()
-    # antes do 1º retorno válido, índice = base (ou NaN se preferir); deixo base.
-    resumo = pd.DataFrame({
-        "retorno_grupo": ret_grupo,
-        "indice": idx,
-        "n_fundos": valido.sum(axis=1).astype(int),
-    })
-
-    # trilha de auditoria (long): cada número reconstruível
-    def long(m, nome):
-        return m.stack(future_stack=True).rename(nome)
-    audit = pd.concat([
-        long(cota, "cota"), long(cota.shift(1), "cota_ant"),
-        long(ret, "retorno_bruto"), long(outlier, "outlier"),
-        long(pl, "pl"), long(pl_ant, "pl_ant"),
-        long(peso, "peso"), long(contrib, "contribuicao"),
-    ], axis=1).reset_index()
-    audit = audit[audit[["cota", "pl"]].notna().any(axis=1)]
-    return resumo, audit
+    pl_peso = pl_ant.where(valido)
+    soma_pl = pl_peso.sum(axis=1)
+    peso = pl_peso.div(soma_pl, axis=0)                 # Passo 2
+    ret_grupo = (peso * ret_val.where(valido)).sum(axis=1).where(soma_pl > 0)  # Passo 3
+    idx = INDICE_BASE * (1.0 + ret_grupo.fillna(0.0)).cumprod()               # Passo 4
+    return pd.DataFrame({"retorno_grupo": ret_grupo, "indice": idx,
+                         "n_fundos": valido.sum(axis=1).astype(int)})
 
 
-# --------------------------------------------------------------------------
-# Resumo estatístico por grupo
-# --------------------------------------------------------------------------
 def estatisticas(ind: pd.DataFrame, nome: str) -> dict:
-    serie_idx = ind["indice"].dropna()
+    s = ind["indice"].dropna()
     r = ind["retorno_grupo"].dropna()
-    if len(serie_idx) < 2:
-        return {"grupo": nome, "obs": len(serie_idx)}
-    dias = (serie_idx.index[-1] - serie_idx.index[0]).days or 1
-    acum = serie_idx.iloc[-1] / serie_idx.iloc[0] - 1
-    anualizado = (1 + acum) ** (365.0 / dias) - 1
-    vol_anual = r.std() * np.sqrt(252)
-    return {
-        "grupo": nome, "inicio": serie_idx.index[0].date(), "fim": serie_idx.index[-1].date(),
-        "obs_dias": len(serie_idx), "fundos_medio": round(ind["n_fundos"].mean(), 1),
-        "retorno_acumulado": acum, "retorno_anualizado": anualizado, "vol_anualizada": vol_anual,
-    }
+    if len(s) < 2:
+        return {"grupo": nome, "obs": len(s)}
+    dias = (s.index[-1] - s.index[0]).days or 1
+    acum = s.iloc[-1] / s.iloc[0] - 1
+    return {"grupo": nome, "inicio": s.index[0].date(), "fim": s.index[-1].date(),
+            "obs_dias": len(s), "fundos_medio": round(ind["n_fundos"].mean(), 1),
+            "retorno_acumulado": acum, "retorno_anualizado": (1 + acum) ** (365.0 / dias) - 1,
+            "vol_anualizada": r.std() * np.sqrt(252)}
+
+
+# --------------------------------------------------------------------------
+# Painel diário em formato longo (data, grupo, chave, cota, pl) -- os
+# ÚNICOS valores crus do Excel; o resto vira fórmula.
+# --------------------------------------------------------------------------
+def painel_longo(serie: pd.DataFrame, chaves: list[str], grupo: str) -> pd.DataFrame:
+    cota, pl = painel_diario(serie, chaves)
+    lon = (cota.stack(future_stack=True).rename("cota").to_frame()
+           .join(pl.stack(future_stack=True).rename("pl")).reset_index())
+    lon = lon.dropna(subset=["cota"])        # só dias dentro da janela ativa
+    lon["grupo"] = grupo
+    return lon[["data", "grupo", "chave", "cota", "pl"]]
+
+
+# --------------------------------------------------------------------------
+# SAÍDA: Excel com FÓRMULAS vivas (nada de valor colado nas colunas de cálculo)
+# --------------------------------------------------------------------------
+def exportar_excel(panel: pd.DataFrame, saida: Path) -> None:
+    from openpyxl import Workbook
+
+    panel = panel.sort_values(["chave", "data"]).reset_index(drop=True)
+    n = len(panel)
+    fim = n + 1                               # última linha de dados (linha 1 = cabeçalho)
+    PCT = "0.0000%"; NUM = "0.000000"; DT = "yyyy-mm-dd"
+
+    wb = Workbook()
+    # ---- Aba 1: retornos_por_fundo (valores: data/grupo/chave/cota/pl; resto fórmula) ----
+    ws = wb.active
+    ws.title = "retornos_por_fundo"
+    cols = ["data", "grupo", "chave", "cota", "pl", "cota_ant", "pl_ant", "retorno",
+            "outlier", "valido", "pl_ant_valido", "soma_pl_dia_grupo", "peso", "contribuicao"]
+    ws.append(cols)
+    for i, row in enumerate(panel.itertuples(index=False), start=2):
+        ws.cell(i, 1, row.data.to_pydatetime()).number_format = DT
+        ws.cell(i, 2, row.grupo)
+        ws.cell(i, 3, row.chave)
+        ws.cell(i, 4, float(row.cota))
+        ws.cell(i, 5, float(row.pl))
+        # cota_ant / pl_ant: valor do dia anterior DO MESMO fundo (fórmula de lookup pela linha de cima)
+        ws.cell(i, 6, f'=IF($C{i}=$C{i-1},$D{i-1},"")')
+        ws.cell(i, 7, f'=IF($C{i}=$C{i-1},$E{i-1},"")')
+        # retorno = cota/cota_ant - 1
+        ws.cell(i, 8, f'=IFERROR($D{i}/$F{i}-1,"")').number_format = PCT
+        # outlier = |retorno| > limite
+        ws.cell(i, 9, f'=IF($H{i}="","",ABS($H{i})>{LIMITE_OUTLIER})')
+        # valido = tem retorno, cota_ant>0, pl_ant>0 e não é outlier
+        ws.cell(i, 10, f'=IF($H{i}="",FALSE,AND($F{i}>0,$G{i}>0,NOT($I{i})))')
+        # pl_ant_valido = pl_ant se válido, senão 0 (entra no denominador do peso)
+        ws.cell(i, 11, f'=IF($J{i},$G{i},0)')
+        # soma do pl_ant válido do mesmo dia e grupo (denominador do peso)
+        ws.cell(i, 12, f'=SUMIFS($K$2:$K${fim},$A$2:$A${fim},$A{i},$B$2:$B${fim},$B{i})')
+        # peso = pl_ant_valido / soma_dia  (Passo 2)
+        ws.cell(i, 13, f'=IF($J{i},$K{i}/$L{i},"")').number_format = PCT
+        # contribuicao = peso * retorno
+        ws.cell(i, 14, f'=IF($J{i},$M{i}*$H{i},"")').number_format = PCT
+
+    # ---- Aba 2: indice_diario (retorno do grupo, índice encadeado, nº de fundos) ----
+    datas = sorted(panel["data"].unique())
+    wi = wb.create_sheet("indice_diario")
+    wi.append(["data", "retorno_infra", "indice_infra", "n_fundos_infra",
+               "retorno_ex_infra", "indice_ex_infra", "n_fundos_ex_infra"])
+    SH = "retornos_por_fundo"
+    for j, d in enumerate(datas, start=2):
+        wi.cell(j, 1, pd.Timestamp(d).to_pydatetime()).number_format = DT
+        for (gname, cret, cidx, cnf) in [(GRUPO_INFRA, 2, 3, 4), (GRUPO_EX, 5, 6, 7)]:
+            # Passo 3: retorno do grupo no dia = soma das contribuições
+            wi.cell(j, cret, f'=SUMIFS({SH}!$N$2:$N${fim},{SH}!$A$2:$A${fim},$A{j},'
+                             f'{SH}!$B$2:$B${fim},"{gname}")').number_format = PCT
+            cl = chr(ord("A") + cret - 1)   # coluna da letra do retorno (B ou E)
+            ci = chr(ord("A") + cidx - 1)   # coluna da letra do índice (C ou F)
+            # Passo 4: índice base 100 no 1º dia; depois anterior * (1 + retorno)
+            wi.cell(j, cidx, "=100" if j == 2 else f"={ci}{j-1}*(1+{cl}{j})").number_format = "0.00"
+            # nº de fundos válidos no dia/grupo
+            wi.cell(j, cnf, f'=COUNTIFS({SH}!$K$2:$K${fim},">0",{SH}!$A$2:$A${fim},$A{j},'
+                            f'{SH}!$B$2:$B${fim},"{gname}")')
+    ultcal = len(datas) + 1
+
+    # ---- Aba 3: resumo (também por fórmula, referenciando indice_diario) ----
+    wr = wb.create_sheet("resumo")
+    wr.append(["grupo", "inicio", "fim", "retorno_acumulado", "retorno_anualizado",
+               "vol_anualizada", "fundos_medio"])
+    # (nome, linha, col retorno, col indice, col n_fundos na aba indice_diario)
+    for nome, linha, cret, cidx, cnf in [(GRUPO_INFRA, 2, "B", "C", "D"),
+                                         (GRUPO_EX, 3, "E", "F", "G")]:
+        wr.cell(linha, 1, nome)
+        wr.cell(linha, 2, "=indice_diario!$A$2").number_format = DT
+        wr.cell(linha, 3, f"=indice_diario!$A${ultcal}").number_format = DT
+        wr.cell(linha, 4, f"=indice_diario!{cidx}{ultcal}/{INDICE_BASE}-1").number_format = PCT
+        wr.cell(linha, 5, f"=(1+D{linha})^(365/(C{linha}-B{linha}))-1").number_format = PCT
+        wr.cell(linha, 6, f"=STDEV(indice_diario!{cret}2:{cret}{ultcal})*SQRT(252)").number_format = PCT
+        wr.cell(linha, 7, f"=AVERAGE(indice_diario!{cnf}2:{cnf}{ultcal})").number_format = "0.0"
+
+    # ---- Aba 4: metodologia ----
+    wm = wb.create_sheet("metodologia")
+    for linha in [
+        ["Todas as colunas de calculo sao FORMULAS -- abra no Excel para recalcular."],
+        ["Passo 1 - retorno por fundo:  retorno = cota / cota_ant - 1"],
+        ["Passo 2 - peso pelo PL do dia anterior:  peso = pl_ant_valido / soma_pl_dia_grupo"],
+        ["Passo 3 - retorno do grupo:  retorno_grupo = soma das contribuicoes (peso * retorno)"],
+        ["Passo 4 - indice base 100:  indice_t = indice_(t-1) * (1 + retorno_grupo_t)"],
+        [f"Outlier: |retorno| > {LIMITE_OUTLIER:.0%} marca 'outlier'=VERDADEIRO e zera 'valido' -> sai do dia."],
+        ["Cota repetida (ffill) so dentro da janela ativa do fundo; fundo entra quando tem 2 cotas."],
+        ["ATENCAO: assume cota = total return. Fundos que distribuem (incentivados de infra) tem a"],
+        ["cota reduzida na distribuicao, o que SUBESTIMA o retorno -- validar antes de concluir."],
+    ]:
+        wm.append(linha)
+
+    wb.save(saida)
 
 
 # --------------------------------------------------------------------------
@@ -284,13 +360,12 @@ def main() -> None:
     serie = serie.merge(cls, on="chave", how="inner")
     cob = serie["chave"].nunique()
     log(f"Fundos com classificação E série: {cob}")
-    por_grupo = serie.groupby("grupo")["chave"].nunique().to_dict()
-    log(f"  por grupo: {por_grupo}")
+    log(f"  por grupo: {serie.groupby('grupo')['chave'].nunique().to_dict()}")
     if cob == 0:
         sys.exit("Nenhum fundo casou entre série e classificação -- confira CHAVE_SERIE "
                  "e a coluna de chave do arquivo de classificação.")
 
-    indices, audits, stats = {}, [], []
+    paineis, stats = [], []
     for nome in (GRUPO_INFRA, GRUPO_EX):
         chaves = serie.loc[serie["grupo"] == nome, "chave"].unique().tolist()
         if not chaves:
@@ -298,54 +373,24 @@ def main() -> None:
             continue
         log(f"Grupo '{nome}': {len(chaves)} fundos")
         cota, pl = painel_diario(serie, chaves)
-        ind, audit = indice_do_grupo(cota, pl)
-        audit.insert(1, "grupo", nome)
-        indices[nome] = ind
-        audits.append(audit)
-        stats.append(estatisticas(ind, nome))
+        stats.append(estatisticas(indice_do_grupo(cota, pl), nome))   # só p/ conferência
+        paineis.append(painel_longo(serie, chaves, nome))
 
-    # monta aba do índice diário (uma coluna por grupo)
-    ind_diario = pd.DataFrame(index=sorted(serie["data"].unique()))
-    ind_diario.index.name = "data"
-    for nome, ind in indices.items():
-        suf = nome.replace("-", "_")
-        ind_diario[f"indice_{suf}"] = ind["indice"]
-        ind_diario[f"retorno_{suf}"] = ind["retorno_grupo"]
-        ind_diario[f"n_fundos_{suf}"] = ind["n_fundos"]
-    ind_diario = ind_diario.reset_index()
-
-    audit_all = pd.concat(audits, ignore_index=True) if audits else pd.DataFrame()
-    df_stats = pd.DataFrame(stats)
-
-    metodologia = pd.DataFrame({"metodologia": [
-        "Passo 1 - retorno por fundo: r_i,t = cota_i,t / cota_i,(t-1) - 1",
-        "Passo 2 - peso pelo PL do dia anterior: w_i,t = PL_i,(t-1) / soma(PL_(t-1) do grupo)",
-        "Passo 3 - retorno do grupo: R_G,t = soma_i( w_i,t * r_i,t )",
-        "Passo 4 - indice base 100: I_G,t = I_G,(t-1) * (1 + R_G,t), I_G,0 = 100",
-        f"Outlier: |r| > {LIMITE_OUTLIER:.0%} e excluido do dia (coluna 'outlier'); pesos renormalizados.",
-        "Cota repetida (ffill) so dentro da janela ativa do fundo; fundo entra com 2 cotas.",
-        "ATENCAO: assume cota = total return. Fundos que distribuem (ex.: incentivados de infra) "
-        "tem a cota reduzida na distribuicao, o que SUBESTIMA o retorno -- validar antes de concluir.",
-        "Confira qualquer numero na aba 'retornos_por_fundo': contribuicao = peso * retorno; "
-        "o retorno do grupo no dia e a soma das contribuicoes.",
-    ]})
+    panel = pd.concat(paineis, ignore_index=True)
+    linhas = len(panel)
+    log(f"Painel diário (linhas de fundo x dia): {linhas}")
+    if linhas > 1_048_575:
+        sys.exit(f"Painel tem {linhas} linhas, acima do limite do Excel (~1,05M). "
+                 "Reduza o período ou a lista de fundos.")
 
     saida = PASTA_SAIDA / "indice_retorno_fundos.xlsx"
-    with pd.ExcelWriter(saida, engine="openpyxl") as w:
-        ind_diario.to_excel(w, sheet_name="indice_diario", index=False)
-        df_stats.to_excel(w, sheet_name="resumo", index=False)
-        metodologia.to_excel(w, sheet_name="metodologia", index=False)
-        if not audit_all.empty:
-            # limite do Excel: se passar de ~1M linhas, grava a trilha em CSV à parte
-            if len(audit_all) > 1_048_575:
-                audit_all.to_csv(PASTA_SAIDA / "retornos_por_fundo.csv", index=False,
-                                 sep=";", decimal=",", encoding="utf-8-sig")
-                log(f"  trilha com {len(audit_all)} linhas -> CSV à parte (acima do limite do Excel)")
-            else:
-                audit_all.to_excel(w, sheet_name="retornos_por_fundo", index=False)
-    log(f"Excel salvo: {saida}")
+    exportar_excel(panel, saida)
+    log(f"Excel salvo (fórmulas vivas): {saida}")
+    log("  Abra no Excel para recalcular -- visualizadores que não calculam mostram zero/vazio.")
+
+    df_stats = pd.DataFrame(stats)
     if not df_stats.empty:
-        log("Resumo:\n" + df_stats.to_string(index=False))
+        log("Conferência (Python, NÃO é o que vai no Excel):\n" + df_stats.to_string(index=False))
     (PASTA_SAIDA / "log_analise.txt").write_text("\n".join(LOG), encoding="utf-8")
 
 
