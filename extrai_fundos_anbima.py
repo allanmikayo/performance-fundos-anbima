@@ -66,11 +66,19 @@ CERTIFICADO_CA = None
 # PERÍODO da série histórica ("AAAA-MM-DD" ou None).
 # None nos dois = API devolve os últimos 5 anos. Períodos > 5 anos são
 # quebrados em janelas automaticamente.
-DATA_INICIO = None
-DATA_FIM = None
+DATA_INICIO = "2025-10-01"
+DATA_FIM = "2026-10-16"
+
+# >>> ALTERAR (5) -- SAÍDA EM EXCEL (.xlsx) para subir no GitHub
+# Além dos CSVs (que ficam em output/<data_hora>/, ignorados pelo git), o
+# script grava os 3 resultados principais em Excel numa pasta fixa, que é
+# o que você sobe no GitHub. Sobrescreve a cada rodada.
+GERAR_EXCEL = True
+PASTA_EXCEL = PASTA_SCRIPT / "resultados_excel"
 
 # TESTE: processa só os N primeiros CNPJs da lista (None = todos).
-# Recomendado rodar com 10 na primeira vez para conferir o output.
+# Recomendado rodar com 10 na primeira vez para conferir o output;
+# troque para None quando quiser a lista inteira.
 LIMITE_TESTE = 10
 
 # Universo (lista de fundos da ANBIMA) fica em cache por N dias.
@@ -274,6 +282,24 @@ def salvar_json(obj, caminho: Path) -> None:
     caminho.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def salvar_excel(df: pd.DataFrame, nome: str) -> None:
+    """Grava uma cópia .xlsx na pasta fixa PASTA_EXCEL (a que vai pro GitHub).
+    Excel tem limite de ~1.048.576 linhas; se passar, o .xlsx é pulado e fica
+    só o CSV (avisado no log)."""
+    if not GERAR_EXCEL:
+        return
+    Path(PASTA_EXCEL).mkdir(parents=True, exist_ok=True)
+    destino = Path(PASTA_EXCEL) / f"{nome}.xlsx"
+    if len(df) > 1_048_575:
+        log(f"  '{nome}' tem {len(df)} linhas (acima do limite do Excel) -- .xlsx pulado, use o CSV")
+        return
+    try:
+        df.to_excel(destino, index=False)
+        log(f"  Excel: {destino}")
+    except Exception as e:
+        log(f"  falha ao gravar {destino.name} ({e.__class__.__name__}: {e}) -- CSV foi mantido")
+
+
 # --------------------------------------------------------------------------
 # Etapa 1 -- universo (com cache) e mapeamento CNPJ -> codigo_classe
 # --------------------------------------------------------------------------
@@ -403,6 +429,7 @@ def extrair_cadastro(api: Anbima, mapa: pd.DataFrame, out: Path) -> pd.DataFrame
             log(f"  [{i}/{len(alvos)}] ok")
     df = pd.DataFrame(linhas)
     df.to_csv(out / "cadastro_classes.csv", **CSV_KW)
+    salvar_excel(df, "cadastro_classes")
     log(f"  cadastro: {len(df)} classes, {df.shape[1]} colunas")
     return df
 
@@ -461,6 +488,7 @@ def extrair_serie(api: Anbima, mapa: pd.DataFrame, out: Path) -> pd.DataFrame:
         serie = serie.drop_duplicates(["codigo_classe_consultado", "data_competencia"])
         serie = serie.sort_values(["cnpj_input", "codigo_classe_consultado", "data_competencia"])
     serie.to_csv(out / "serie_historica.csv", **CSV_KW)
+    salvar_excel(serie, "serie_historica")
     log(f"  série: {len(serie)} linhas")
     return serie
 
@@ -477,6 +505,7 @@ def main() -> None:
         universo = obter_universo(api, out)
         mapa = mapear_cnpjs(universo, cnpjs)
         mapa.to_csv(out / "mapa_cnpj_classe.csv", **CSV_KW)
+        salvar_excel(mapa, "mapa_cnpj_classe")
         nao = mapa[mapa["encontrado_como"] == "NAO ENCONTRADO"]["cnpj_input"].tolist()
         log(f"mapeamento: {len(cnpjs) - len(nao)}/{len(cnpjs)} CNPJs encontrados -> "
             f"{mapa['codigo_classe'].nunique() if 'codigo_classe' in mapa else 0} classes")
