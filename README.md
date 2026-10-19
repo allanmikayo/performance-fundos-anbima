@@ -22,3 +22,37 @@ Saídas em `output/<data_hora>/`: `mapa_cnpj_classe.csv`,
 `cadastro_classes.csv`, `serie_historica.csv` e as respostas cruas em `raw/`.
 
 > O `.env` com as credenciais fica fora do repositório (`.gitignore`).
+
+## Análise: índice de retorno (infra x ex-infra)
+
+`indice_retorno_fundos.py` lê o `serie_historica.csv` da extração e monta um
+índice de valorização diário, ponderado por PL, separado por grupo.
+
+1. `python indice_retorno_fundos.py`
+2. Na primeira vez sem `classificacao_fundos.csv`, ele **gera uma base
+   fictícia** (metade infra / metade ex-infra) só para o pipeline rodar.
+   **Substitua** esse arquivo pela classificação real e rode de novo.
+
+Formato do `classificacao_fundos.csv` (separador `;`):
+
+```
+chave;grupo
+C0000016713;infra
+C0000012345;ex-infra
+```
+
+A coluna `chave` casa com `CHAVE_SERIE` do script (padrão
+`codigo_classe_consultado`; use `cnpj_input` se preferir casar por CNPJ).
+
+Metodologia (também na aba `metodologia` do Excel):
+- retorno por fundo: `r = cota_t / cota_(t-1) - 1`
+- peso pelo PL do dia anterior: `w = PL_(t-1) / Σ PL_(t-1) do grupo`
+- retorno do grupo: `R = Σ (w · r)`  →  índice base 100: `I_t = I_(t-1)·(1+R)`
+
+Saída em `analise_output/indice_retorno_fundos.xlsx` (abas `indice_diario`,
+`retornos_por_fundo` com a trilha de cada número, `resumo`, `metodologia`).
+
+> **Atenção:** o índice assume que a cota é *total return*. Fundos que
+> distribuem rendimentos (caso comum nos incentivados de infra) têm a cota
+> reduzida na distribuição, o que subestima o retorno — validar antes de
+> concluir a comparação infra x ex-infra.

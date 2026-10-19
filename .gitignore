@@ -4,3 +4,7 @@
 output/
 __pycache__/
 *.pyc
+
+# Analise
+analise_output/
+classificacao_fundos.csv
