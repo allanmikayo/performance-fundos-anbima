@@ -1,0 +1,6 @@
+# Credenciais -- NUNCA subir
+.env
+# Saídas da extração
+output/
+__pycache__/
+*.pyc

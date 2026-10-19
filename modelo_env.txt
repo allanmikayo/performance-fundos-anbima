@@ -1,0 +1,4 @@
+# Copie este arquivo, renomeie a copia para ".env" (mesma pasta do script) e preencha.
+# Credenciais em https://admin-developers.anbima.com.br/api-portal/user
+ANBIMA_CLIENT_ID=
+ANBIMA_CLIENT_SECRET=
