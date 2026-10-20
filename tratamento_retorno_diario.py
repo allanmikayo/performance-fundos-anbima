@@ -57,7 +57,7 @@ MAX_GAP_MEDIANO_DIAS = 4     # fundo é "diário" se a mediana do intervalo entr
 MIN_OBS = 30                 # ignora séries curtas (menos de N cotas)
 MAX_GAP_RETORNO_DIAS = 5     # retorno só vale se a cota anterior está a <= N dias (fds/feriado)
 
-EXPORTAR_TRILHA = False      # True => grava também um CSV com as colunas auxiliares
+EXPORTAR_TRILHA = True       # grava também um CSV de auditoria com as colunas auxiliares
 INDICE_BASE = 100.0
 PASTA_SAIDA = PASTA_SCRIPT / "analise_output"
 # ════════════════════ FIM DA CONFIGURAÇÃO ═══════════════════════════
@@ -67,6 +67,7 @@ import re
 import sys
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
 LOG: list[str] = []
@@ -167,26 +168,41 @@ def calcular(obs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     o["pl_ant"] = o.groupby("cnpj")["pl"].shift(1)
     o["gap_dias"] = o.groupby("cnpj")["data"].diff().dt.days
     o["retorno"] = o["cota"] / o["cota_ant"] - 1
+    o["grupo"] = np.where(o["infra"], "infra", "nao_infra")
 
     # fonte do peso
-    if PESO_POR == "lista":
-        o["peso_base"] = o["pl_lista"]
-    else:
-        o["peso_base"] = o["pl_ant"]
+    o["peso_base"] = o["pl_lista"] if PESO_POR == "lista" else o["pl_ant"]
 
     o["valido"] = (o["retorno"].notna() & (o["gap_dias"] <= MAX_GAP_RETORNO_DIAS)
                    & (o["cota_ant"] > 0) & (o["peso_base"] > 0))
 
     v = o[o["valido"]].copy()
-    v["soma_peso_dia"] = v.groupby("data")["peso_base"].transform("sum")
+    # peso é ponderado DENTRO de cada grupo (infra entre infra; não-infra entre não-infra)
+    v["soma_peso_dia"] = v.groupby(["data", "grupo"])["peso_base"].transform("sum")
     v["peso"] = v["peso_base"] / v["soma_peso_dia"]
     v["contribuicao"] = v["peso"] * v["retorno"]
 
-    perf = (v.groupby("data")
-              .agg(retorno_pct=("contribuicao", "sum"), n_fundos=("cnpj", "nunique"))
-              .reset_index())
-    perf["indice_base100"] = INDICE_BASE * (1 + perf["retorno_pct"]).cumprod()
+    g = (v.groupby(["data", "grupo"])
+           .agg(retorno_pct=("contribuicao", "sum"), n_fundos=("cnpj", "nunique"))
+           .reset_index())
+    ret = g.pivot(index="data", columns="grupo", values="retorno_pct")
+    nf = g.pivot(index="data", columns="grupo", values="n_fundos")
+    for col in ("infra", "nao_infra"):           # garante as duas colunas mesmo se faltar um grupo
+        if col not in ret.columns:
+            ret[col] = np.nan
+        if col not in nf.columns:
+            nf[col] = np.nan
+    idx = INDICE_BASE * (1 + ret[["infra", "nao_infra"]].fillna(0.0)).cumprod()
 
+    perf = pd.DataFrame({
+        "data": ret.index,
+        "retorno_infra": ret["infra"].values,
+        "retorno_nao_infra": ret["nao_infra"].values,
+        "indice_infra": idx["infra"].values,
+        "indice_nao_infra": idx["nao_infra"].values,
+        "n_fundos_infra": nf["infra"].values,
+        "n_fundos_nao_infra": nf["nao_infra"].values,
+    })
     o = o.merge(v[["data", "cnpj", "soma_peso_dia", "peso", "contribuicao"]],
                 on=["data", "cnpj"], how="left")
     return o, perf
@@ -196,19 +212,22 @@ def exportar(perf: pd.DataFrame, saida: Path) -> None:
     with pd.ExcelWriter(saida, engine="openpyxl") as w:
         perf.to_excel(w, sheet_name="performance_diaria", index=False)
         ws = w.sheets["performance_diaria"]
+        fmt = {1: "yyyy-mm-dd", 2: "0.0000%", 3: "0.0000%", 4: "0.0000", 5: "0.0000"}
         for linha in range(2, len(perf) + 2):
-            ws.cell(linha, 1).number_format = "yyyy-mm-dd"
-            ws.cell(linha, 2).number_format = "0.0000%"
-            ws.cell(linha, 4).number_format = "0.0000"
+            for col, f in fmt.items():
+                ws.cell(linha, col).number_format = f
         met = pd.DataFrame({"metodologia": [
-            f"Grupo infra, so fundos diarios (gap mediano <= {MAX_GAP_MEDIANO_DIAS}, obs >= {MIN_OBS}).",
+            f"Dois grupos lado a lado: infra e nao_infra. So fundos diarios "
+            f"(gap mediano <= {MAX_GAP_MEDIANO_DIAS}, obs >= {MIN_OBS}).",
             f"Ponderacao por PL: fonte = '{PESO_POR}' "
-            f"({'PL do dia anterior da serie' if PESO_POR=='serie' else 'PL fixo do lista_fundos'}).",
+            f"({'PL do dia anterior da serie' if PESO_POR=='serie' else 'PL fixo do lista_fundos'}); "
+            "peso renormalizado dentro de cada grupo, por dia.",
             "retorno = valor_cota / valor_cota_anterior - 1 (por observacao do fundo).",
             f"so vale como diario se o gap ate a cota anterior <= {MAX_GAP_RETORNO_DIAS} dias.",
-            "peso = PL / soma(PL dos validos no dia); retorno_pct = soma(peso * retorno).",
-            "indice_t = indice_(t-1) * (1 + retorno_pct_t), base 100.",
+            "retorno_<grupo> = soma(peso * retorno) dos fundos do grupo no dia.",
+            "indice_<grupo>_t = indice_(t-1) * (1 + retorno_<grupo>_t), base 100.",
             "ATENCAO: assume cota = total return; fundos de infra que distribuem subestimam o retorno.",
+            "Auditoria (cota_ant, peso, contribuicao por fundo/dia): retorno_diario_trilha.csv.",
         ]})
         met.to_excel(w, sheet_name="metodologia", index=False)
 
@@ -218,29 +237,31 @@ def main() -> None:
     serie = ler_serie()
     lista = ler_lista()
 
-    # junta e filtra infra
+    # junta (mantém os dois grupos: infra e não-infra)
     serie = serie.merge(lista, on="cnpj", how="inner")
-    achou = serie["cnpj"].nunique()
-    log(f"CNPJs casados entre série e lista: {achou}")
-    serie = serie[serie["infra"]]
+    log(f"CNPJs casados entre série e lista: {serie['cnpj'].nunique()} "
+        f"(infra: {serie.loc[serie['infra'],'cnpj'].nunique()}, "
+        f"nao_infra: {serie.loc[~serie['infra'],'cnpj'].nunique()})")
     if serie.empty:
-        sys.exit("Nenhum fundo infra casou entre série e lista. Confira a coluna 'infra' e os CNPJs.")
-    log(f"  fundos infra com série: {serie['cnpj'].nunique()}")
+        sys.exit("Nenhum CNPJ casou entre série e lista. Confira os CNPJs nos dois arquivos.")
     if PESO_POR == "lista" and serie["pl_lista"].isna().all():
         sys.exit("PESO_POR='lista' mas a coluna de PL do lista_fundos veio vazia/sem valores.")
 
     chaves = selecionar_diarios(serie)
-    obs = serie[serie["cnpj"].isin(chaves)][["data", "cnpj", "cota", "pl", "pl_lista"]]
+    obs = serie[serie["cnpj"].isin(chaves)][["data", "cnpj", "cota", "pl", "pl_lista", "infra"]]
     if obs.empty:
-        sys.exit("Nenhum fundo infra diário após os filtros -- afrouxe MAX_GAP_MEDIANO_DIAS/MIN_OBS.")
+        sys.exit("Nenhum fundo diário após os filtros -- afrouxe MAX_GAP_MEDIANO_DIAS/MIN_OBS.")
 
     trilha, perf = calcular(obs)
 
     saida = PASTA_SAIDA / "retorno_diario_cota.xlsx"
     exportar(perf, saida)
     log(f"Excel salvo: {saida}  ({len(perf)} dias)")
-    log(f"  retorno acumulado = {perf['indice_base100'].iloc[-1]/INDICE_BASE-1:.4%}; "
-        f"fundos/dia médio = {perf['n_fundos'].mean():.1f}")
+    for gr in ("infra", "nao_infra"):
+        s = perf[f"indice_{gr}"].dropna()
+        if len(s):
+            log(f"  {gr}: retorno acumulado = {s.iloc[-1]/INDICE_BASE-1:.4%}; "
+                f"fundos/dia médio = {perf[f'n_fundos_{gr}'].mean():.1f}")
 
     if EXPORTAR_TRILHA:
         csv = PASTA_SAIDA / "retorno_diario_trilha.csv"
