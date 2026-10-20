@@ -74,3 +74,20 @@ Saída `analise_output/retorno_diario_cota.xlsx`: abas `performance_diaria`
 (data, retorno %, nº de fundos, índice base 100), `retornos_por_fundo`
 (trilha por fundo × dia), `selecao_fundos` (regra de corte como fórmula) e
 `metodologia`. Tudo em fórmulas vivas — abra no Excel para recalcular.
+
+## Tratamento a partir de serie_historica + lista_fundos
+
+`tratamento_retorno_diario.py` é uma versão independente que lê **dois
+arquivos** e exporta só a série diária (cálculo em Python, arquivo leve):
+
+- `serie_historica` — colunas `cnpj_input`, `data_competencia`,
+  `valor_patrimonio_liquido`, `valor_cota`.
+- `lista_fundos` — colunas `cnpj`, `PL`, `infra` (diz se o fundo é de infra).
+
+Liga os dois pelo CNPJ (limpo para 14 dígitos nos dois lados), mantém só os
+`infra` com report diário, e exporta `analise_output/retorno_diario_cota.xlsx`
+(aba `performance_diaria`: data, retorno %, nº de fundos, índice base 100).
+
+`PESO_POR` escolhe a ponderação: `"serie"` (PL do dia anterior, dinâmico —
+padrão) ou `"lista"` (PL fixo do lista_fundos). `EXPORTAR_TRILHA=True` grava
+um CSV com as colunas auxiliares para auditar.
