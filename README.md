@@ -56,3 +56,21 @@ Saída em `analise_output/indice_retorno_fundos.xlsx` (abas `indice_diario`,
 > distribuem rendimentos (caso comum nos incentivados de infra) têm a cota
 > reduzida na distribuição, o que subestima o retorno — validar antes de
 > concluir a comparação infra x ex-infra.
+
+## Retorno diário da cota (um grupo, só fundos diários)
+
+`retorno_diario_cota.py` entrega a série `data | retorno_pct` de um grupo
+(padrão `infra`), ponderada por PL, usando **só** fundos com report diário.
+
+- Filtra pelo grupo (classificacao_fundos.csv) e por report diário
+  (mediana do intervalo entre cotas ≤ `MAX_GAP_MEDIANO_DIAS`, mín.
+  `MIN_OBS` cotas).
+- Retorno entre observações consecutivas; só vale como diário se o gap até a
+  cota anterior ≤ `MAX_GAP_RETORNO_DIAS` (cobre fim de semana/feriado).
+- Peso pelo PL da observação anterior, renormalizado a cada dia entre os
+  fundos presentes — resolve comprimentos diferentes e entradas/saídas.
+
+Saída `analise_output/retorno_diario_cota.xlsx`: abas `performance_diaria`
+(data, retorno %, nº de fundos, índice base 100), `retornos_por_fundo`
+(trilha por fundo × dia), `selecao_fundos` (regra de corte como fórmula) e
+`metodologia`. Tudo em fórmulas vivas — abra no Excel para recalcular.
