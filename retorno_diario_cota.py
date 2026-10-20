@@ -1,31 +1,29 @@
 """Retorno DIÁRIO da cota, por grupo (padrão: infra), ponderado por PL.
 
-Entrega: uma série com DATA e o % de PERFORMANCE do dia (retorno do grupo,
-ponderado pelo PL). Usa SÓ as cotas e o PL do serie_historica.csv -- nada de
-captação aqui (esse dado você cruza de outra base depois).
+Entrega ENXUTA: um Excel pequeno só com a série  data | retorno_pct  (mais
+nº de fundos e um índice base 100 de cortesia). Todo o cálculo é feito em
+Python; o arquivo NÃO carrega as colunas auxiliares nem fórmulas, para ficar
+leve. Se quiser auditar, ligue EXPORTAR_TRILHA e sai um CSV com tudo.
 
-Três filtros/tratamentos pedidos:
-  1) GRUPO: mantém só os fundos do grupo alvo (padrão 'infra'), pela
-     classificacao_fundos.csv.
-  2) REPORT DIÁRIO: mantém só fundos cuja mediana do intervalo entre cotas
-     é <= MAX_GAP_MEDIANO_DIAS (fundo diário tem mediana ~1; mensal ~30).
-  3) FREQUÊNCIA/BURACOS desiguais: o retorno é calculado entre observações
-     CONSECUTIVAS da cota. Só vale como retorno "diário" se o intervalo até a
-     cota anterior for <= MAX_GAP_RETORNO_DIAS (cobre fim de semana/feriado).
-     Gap maior é descartado. Comprimentos diferentes e entradas/saídas se
-     resolvem porque o PESO é renormalizado a cada dia entre os fundos presentes.
+Usa SÓ as cotas e o PL do serie_historica.csv (captação você cruza de outra
+base depois).
 
-FÓRMULAS (Passo a passo; no Excel tudo é fórmula viva):
-  retorno do fundo i no dia t:   r_i,t = cota_i,t / cota_i,(obs anterior) - 1
-  peso pelo PL da obs anterior:  w_i,t = PL_i,ant / soma(PL_ant dos válidos no dia t)
-  performance do grupo no dia t: R_t = soma_i( w_i,t * r_i,t )
-  índice base 100 (cortesia):    I_t = I_(t-1) * (1 + R_t)
+Filtros/tratamentos:
+  1) GRUPO: só os fundos do grupo alvo (classificacao_fundos.csv).
+  2) REPORT DIÁRIO: só fundos com mediana do intervalo entre cotas
+     <= MAX_GAP_MEDIANO_DIAS e no mínimo MIN_OBS cotas.
+  3) BURACOS/comprimentos desiguais: retorno entre observações consecutivas da
+     cota, válido só se o gap até a anterior <= MAX_GAP_RETORNO_DIAS; o peso é
+     renormalizado a cada dia entre os fundos presentes.
 
-SAÍDA: retorno_diario_cota.xlsx
-  - performance_diaria   data | retorno_pct | n_fundos | indice_base100   <-- o que você pediu
-  - retornos_por_fundo   trilha por fundo x dia (cota, cota_ant, gap, retorno, peso, contribuição)
-  - selecao_fundos       cada fundo do grupo com nº de obs, gap mediano e a regra 'entra' (fórmula)
-  - metodologia
+Fórmulas (calculadas em Python):
+  retorno  = cota / cota_ant - 1
+  peso     = pl_ant / soma(pl_ant dos válidos no dia)
+  retorno_pct (do grupo) = soma(peso * retorno)
+  indice_t = indice_(t-1) * (1 + retorno_pct_t),  base 100
+
+SAÍDA: analise_output/retorno_diario_cota.xlsx  (aba performance_diaria + metodologia)
+       analise_output/retorno_diario_trilha.csv (só se EXPORTAR_TRILHA = True)
 """
 from __future__ import annotations
 
@@ -36,24 +34,18 @@ from pathlib import Path
 
 PASTA_SCRIPT = Path(__file__).resolve().parent
 
-# >>> ALTERAR (1) -- série histórica (None = acha o mais recente em output/)
-ARQUIVO_SERIE = None
-
-# >>> ALTERAR (2) -- classificação infra/ex-infra (mesmo arquivo da outra análise)
+ARQUIVO_SERIE = None                                   # None = acha o mais recente em output/
 ARQUIVO_CLASSIFICACAO = PASTA_SCRIPT / "classificacao_fundos.csv"
 COL_CHAVE_CLASSIF = "chave"
 COL_GRUPO = "grupo"
-CHAVE_SERIE = "codigo_classe_consultado"   # ou "cnpj_input"
-
-# >>> ALTERAR (3) -- grupo a analisar
+CHAVE_SERIE = "codigo_classe_consultado"               # ou "cnpj_input"
 GRUPO_ALVO = "infra"
 
-# Regras de seleção/limpeza
-MAX_GAP_MEDIANO_DIAS = 4     # fundo é "diário" se a mediana do intervalo entre cotas <= isto
-MIN_OBS = 30                 # ignora séries curtas demais (menos de N cotas no período)
-MAX_GAP_RETORNO_DIAS = 5     # retorno só vale se a cota anterior está a <= N dias (fim de semana/feriado)
-MIN_FUNDOS_DIA = 1           # nº mínimo de fundos para o dia valer (informativo)
+MAX_GAP_MEDIANO_DIAS = 4     # define "fundo diário"
+MIN_OBS = 30                 # ignora séries curtas
+MAX_GAP_RETORNO_DIAS = 5     # retorno só vale se a cota anterior está a <= N dias
 
+EXPORTAR_TRILHA = False      # True => grava também um CSV com as colunas auxiliares (cota_ant, peso, etc.)
 INDICE_BASE = 100.0
 PASTA_SAIDA = PASTA_SCRIPT / "analise_output"
 # ════════════════════ FIM DA CONFIGURAÇÃO ═══════════════════════════
@@ -62,7 +54,6 @@ PASTA_SAIDA = PASTA_SCRIPT / "analise_output"
 import sys
 from datetime import datetime
 
-import numpy as np
 import pandas as pd
 
 LOG: list[str] = []
@@ -125,148 +116,90 @@ def ler_classificacao() -> pd.DataFrame:
     return cls[cls["chave"] != ""].drop_duplicates("chave")
 
 
-def diagnostico_frequencia(serie: pd.DataFrame) -> pd.DataFrame:
-    """Por fundo: nº de obs e mediana do intervalo (dias) entre cotas."""
+def selecionar_diarios(serie: pd.DataFrame) -> tuple[set, pd.DataFrame]:
+    """Fundos diários = mediana do intervalo entre cotas <= MAX_GAP_MEDIANO_DIAS e n_obs >= MIN_OBS."""
     def stats(g):
         d = g["data"].sort_values()
-        gap = d.diff().dt.days.median()
-        return pd.Series({"n_obs": len(d), "gap_mediano_dias": gap})
-    return serie.groupby("chave").apply(stats, include_groups=False).reset_index()
+        return pd.Series({"n_obs": len(d), "gap_mediano_dias": d.diff().dt.days.median()})
+    freq = serie.groupby("chave").apply(stats, include_groups=False).reset_index()
+    ok = freq[(freq["gap_mediano_dias"] <= MAX_GAP_MEDIANO_DIAS) & (freq["n_obs"] >= MIN_OBS)]
+    return set(ok["chave"]), freq
 
 
-# --------------------------------------------------------------------------
-# SAÍDA em Excel com fórmulas vivas
-# --------------------------------------------------------------------------
-def exportar_excel(obs: pd.DataFrame, selecao: pd.DataFrame, saida: Path) -> None:
-    from openpyxl import Workbook
+def calcular(obs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Colunas auxiliares (em Python) + série diária do grupo."""
+    o = obs.sort_values(["chave", "data"]).copy()
+    o["cota_ant"] = o.groupby("chave")["cota"].shift(1)
+    o["pl_ant"] = o.groupby("chave")["pl"].shift(1)
+    o["gap_dias"] = o.groupby("chave")["data"].diff().dt.days
+    o["retorno"] = o["cota"] / o["cota_ant"] - 1
+    o["valido"] = (o["retorno"].notna() & (o["gap_dias"] <= MAX_GAP_RETORNO_DIAS)
+                   & (o["pl_ant"] > 0) & (o["cota_ant"] > 0))
 
-    obs = obs.sort_values(["chave", "data"]).reset_index(drop=True)
-    n = len(obs); fim = n + 1
-    PCT = "0.0000%"; DT = "yyyy-mm-dd"
+    v = o[o["valido"]].copy()
+    v["soma_pl_dia"] = v.groupby("data")["pl_ant"].transform("sum")   # Σ PL_ant dos válidos no dia
+    v["peso"] = v["pl_ant"] / v["soma_pl_dia"]                        # peso ponderado por PL
+    v["contribuicao"] = v["peso"] * v["retorno"]                     # peso * retorno
 
-    wb = Workbook()
-    # ---- Aba 1: retornos_por_fundo ----
-    ws = wb.active
-    ws.title = "retornos_por_fundo"
-    ws.append(["data", "chave", "cota", "pl", "data_ant", "cota_ant", "pl_ant", "gap_dias",
-               "retorno", "valido", "pl_ant_valido", "soma_pl_dia", "peso", "contribuicao"])
-    for i, r in enumerate(obs.itertuples(index=False), start=2):
-        ws.cell(i, 1, r.data.to_pydatetime()).number_format = DT
-        ws.cell(i, 2, r.chave)
-        ws.cell(i, 3, float(r.cota))
-        ws.cell(i, 4, float(r.pl))
-        # valores do dia anterior DO MESMO fundo (linha de cima, se mesma chave)
-        ws.cell(i, 5, f'=IF($B{i}=$B{i-1},$A{i-1},"")').number_format = DT
-        ws.cell(i, 6, f'=IF($B{i}=$B{i-1},$C{i-1},"")')
-        ws.cell(i, 7, f'=IF($B{i}=$B{i-1},$D{i-1},"")')
-        # gap em dias entre a cota e a cota anterior
-        ws.cell(i, 8, f'=IF($E{i}="","",$A{i}-$E{i})')
-        # retorno = cota / cota_ant - 1
-        ws.cell(i, 9, f'=IFERROR($C{i}/$F{i}-1,"")').number_format = PCT
-        # valido: tem retorno, gap pequeno, cota_ant e pl_ant positivos
-        ws.cell(i, 10, f'=IF($I{i}="",FALSE,AND($H{i}<={MAX_GAP_RETORNO_DIAS},$F{i}>0,$G{i}>0))')
-        # pl_ant_valido entra no denominador do peso
-        ws.cell(i, 11, f'=IF($J{i},$G{i},0)')
-        # soma do PL anterior válido no mesmo dia (todos os fundos já são do grupo alvo)
-        ws.cell(i, 12, f'=SUMIFS($K$2:$K${fim},$A$2:$A${fim},$A{i})')
-        # peso = pl_ant_valido / soma_dia
-        ws.cell(i, 13, f'=IF($J{i},$K{i}/$L{i},"")').number_format = PCT
-        # contribuicao = peso * retorno
-        ws.cell(i, 14, f'=IF($J{i},$M{i}*$I{i},"")').number_format = PCT
+    perf = (v.groupby("data")
+              .agg(retorno_pct=("contribuicao", "sum"), n_fundos=("chave", "nunique"))
+              .reset_index())
+    perf["indice_base100"] = INDICE_BASE * (1 + perf["retorno_pct"]).cumprod()
 
-    # ---- Aba 2: performance_diaria (data | retorno_pct | n_fundos | indice) ----
-    datas = sorted(obs["data"].unique())
-    wp = wb.create_sheet("performance_diaria")
-    wp.append(["data", "retorno_pct", "n_fundos", "indice_base100"])
-    SH = "retornos_por_fundo"
-    for j, d in enumerate(datas, start=2):
-        wp.cell(j, 1, pd.Timestamp(d).to_pydatetime()).number_format = DT
-        # performance do dia = soma das contribuições (Passo 3)
-        wp.cell(j, 2, f'=SUMIFS({SH}!$N$2:$N${fim},{SH}!$A$2:$A${fim},$A{j})').number_format = PCT
-        # nº de fundos válidos no dia
-        wp.cell(j, 3, f'=COUNTIFS({SH}!$K$2:$K${fim},">0",{SH}!$A$2:$A${fim},$A{j})')
-        # índice base 100 (cortesia)
-        wp.cell(j, 4, "=100" if j == 2 else f"=D{j-1}*(1+B{j})").number_format = "0.0000"
-    ultp = len(datas) + 1
-
-    # ---- Aba 3: selecao_fundos (regra 'entra' como fórmula) ----
-    wsf = wb.create_sheet("selecao_fundos")
-    wsf.append(["chave", "grupo", "n_obs", "gap_mediano_dias", "entra"])
-    for i, r in enumerate(selecao.itertuples(index=False), start=2):
-        wsf.cell(i, 1, r.chave)
-        wsf.cell(i, 2, r.grupo)
-        wsf.cell(i, 3, int(r.n_obs))
-        wsf.cell(i, 4, None if pd.isna(r.gap_mediano_dias) else float(r.gap_mediano_dias))
-        # regra visível: entra se é do grupo alvo, diário e com obs suficientes
-        wsf.cell(i, 5, f'=IF(AND($B{i}="{GRUPO_ALVO}",$D{i}<={MAX_GAP_MEDIANO_DIAS},'
-                       f'$C{i}>={MIN_OBS}),"sim","nao")')
-
-    # ---- Aba 4: metodologia ----
-    wm = wb.create_sheet("metodologia")
-    for linha in [
-        ["Todas as colunas de calculo sao FORMULAS -- abra no Excel para recalcular."],
-        [f"Grupo analisado: {GRUPO_ALVO}. Filtros: diario (gap mediano <= {MAX_GAP_MEDIANO_DIAS} dias) "
-         f"e no minimo {MIN_OBS} cotas."],
-        ["retorno do fundo:  retorno = cota / cota_ant - 1  (cota_ant = cota da observacao anterior do fundo)"],
-        [f"so vale como diario se gap_dias <= {MAX_GAP_RETORNO_DIAS} (cobre fim de semana/feriado); senao sai do dia."],
-        ["peso:  peso = pl_ant_valido / soma_pl_dia   (PL da observacao anterior, renormalizado por dia)"],
-        ["performance do dia:  retorno_pct = soma das contribuicoes (peso * retorno) dos fundos presentes"],
-        ["indice base 100:  indice_t = indice_(t-1) * (1 + retorno_pct_t)"],
-        ["ATENCAO: assume cota = total return. Fundos de infra que distribuem rendimento tem a cota"],
-        ["reduzida na distribuicao, o que subestima o retorno -- validar antes de concluir."],
-    ]:
-        wm.append(linha)
-    wb.save(saida)
-    return ultp
+    # devolve também as colunas auxiliares (para a trilha opcional)
+    o = o.merge(v[["data", "chave", "soma_pl_dia", "peso", "contribuicao"]],
+                on=["data", "chave"], how="left")
+    return o, perf
 
 
-# --------------------------------------------------------------------------
+def exportar(perf: pd.DataFrame, saida: Path) -> None:
+    from openpyxl.styles import numbers
+    with pd.ExcelWriter(saida, engine="openpyxl") as w:
+        perf.to_excel(w, sheet_name="performance_diaria", index=False)
+        ws = w.sheets["performance_diaria"]
+        for linha in range(2, len(perf) + 2):
+            ws.cell(linha, 1).number_format = "yyyy-mm-dd"      # data
+            ws.cell(linha, 2).number_format = "0.0000%"         # retorno_pct
+            ws.cell(linha, 4).number_format = "0.0000"          # indice
+        met = pd.DataFrame({"metodologia": [
+            f"Grupo: {GRUPO_ALVO}. So fundos diarios (gap mediano <= {MAX_GAP_MEDIANO_DIAS}, obs >= {MIN_OBS}).",
+            "retorno do fundo = cota / cota_ant - 1 (cota_ant = cota da observacao anterior do fundo).",
+            f"so vale como diario se o gap ate a cota anterior <= {MAX_GAP_RETORNO_DIAS} dias.",
+            "peso = pl_ant / soma(pl_ant dos validos no dia); renormalizado por dia.",
+            "retorno_pct (grupo) = soma(peso * retorno). indice_t = indice_(t-1) * (1 + retorno_pct_t).",
+            "ATENCAO: assume cota = total return; fundos de infra que distribuem subestimam o retorno.",
+            "Colunas auxiliares (cota_ant, peso, contribuicao, etc.) saem em CSV se EXPORTAR_TRILHA=True.",
+        ]})
+        met.to_excel(w, sheet_name="metodologia", index=False)
+
+
 def main() -> None:
     PASTA_SAIDA.mkdir(parents=True, exist_ok=True)
-    serie = ler_serie(achar_serie())
-    cls = ler_classificacao()
-
-    serie = serie.merge(cls, on="chave", how="inner")
+    serie = ler_serie(achar_serie()).merge(ler_classificacao(), on="chave", how="inner")
     serie = serie[serie["grupo"] == GRUPO_ALVO]
     if serie.empty:
         sys.exit(f"Nenhum fundo do grupo '{GRUPO_ALVO}' casou com a série. Confira CHAVE_SERIE/classificação.")
     log(f"Fundos do grupo '{GRUPO_ALVO}' com série: {serie['chave'].nunique()}")
 
-    # seleção de report diário
-    freq = diagnostico_frequencia(serie)
-    freq["grupo"] = GRUPO_ALVO
-    diarios = freq[(freq["gap_mediano_dias"] <= MAX_GAP_MEDIANO_DIAS) & (freq["n_obs"] >= MIN_OBS)]
-    chaves = set(diarios["chave"])
-    log(f"  diários (gap mediano <= {MAX_GAP_MEDIANO_DIAS}, obs >= {MIN_OBS}): "
-        f"{len(chaves)} de {len(freq)}")
-    excluidos = freq[~freq["chave"].isin(chaves)]
-    if len(excluidos):
-        log(f"  excluídos (não-diários/curtos): {len(excluidos)} "
-            f"(ex. gaps medianos: {sorted(excluidos['gap_mediano_dias'].dropna().unique())[:6]})")
-
+    chaves, freq = selecionar_diarios(serie)
+    log(f"  diários (gap mediano <= {MAX_GAP_MEDIANO_DIAS}, obs >= {MIN_OBS}): {len(chaves)} de {len(freq)}")
     obs = serie[serie["chave"].isin(chaves)][["data", "chave", "cota", "pl"]]
     if obs.empty:
-        sys.exit("Nenhum fundo diário sobrou após os filtros -- afrouxe MAX_GAP_MEDIANO_DIAS/MIN_OBS.")
+        sys.exit("Nenhum fundo diário após os filtros -- afrouxe MAX_GAP_MEDIANO_DIAS/MIN_OBS.")
+
+    trilha, perf = calcular(obs)
 
     saida = PASTA_SAIDA / "retorno_diario_cota.xlsx"
-    exportar_excel(obs, freq.sort_values("chave"), saida)
-    log(f"Excel salvo (fórmulas vivas): {saida}")
-    log("  Abra no Excel para recalcular (visualizador que não calcula mostra vazio).")
+    exportar(perf, saida)
+    log(f"Excel enxuto salvo: {saida}  ({len(perf)} dias)")
+    log(f"  retorno acumulado do grupo = {perf['indice_base100'].iloc[-1]/INDICE_BASE-1:.4%}; "
+        f"fundos/dia médio = {perf['n_fundos'].mean():.1f}")
 
-    # conferência em Python (NÃO é o que vai no Excel; só para log)
-    o = obs.sort_values(["chave", "data"]).copy()
-    o["cota_ant"] = o.groupby("chave")["cota"].shift(1)
-    o["pl_ant"] = o.groupby("chave")["pl"].shift(1)
-    o["gap"] = o.groupby("chave")["data"].diff().dt.days
-    o["ret"] = o["cota"] / o["cota_ant"] - 1
-    val = o["ret"].notna() & (o["gap"] <= MAX_GAP_RETORNO_DIAS) & (o["pl_ant"] > 0)
-    o = o[val]
-    soma = o.groupby("data")["pl_ant"].transform("sum")
-    o["contrib"] = (o["pl_ant"] / soma) * o["ret"]
-    perf = o.groupby("data")["contrib"].sum()
-    idx = INDICE_BASE * (1 + perf).cumprod()
-    log(f"  conferência: {len(perf)} dias; retorno acumulado do grupo = {idx.iloc[-1]/INDICE_BASE-1:.4%}; "
-        f"fundos/dia médio = {o.groupby('data')['chave'].nunique().mean():.1f}")
+    if EXPORTAR_TRILHA:
+        csv = PASTA_SAIDA / "retorno_diario_trilha.csv"
+        trilha.to_csv(csv, index=False, sep=";", decimal=",", encoding="utf-8-sig")
+        log(f"  trilha completa (colunas auxiliares): {csv}")
+
     (PASTA_SAIDA / "log_retorno_diario.txt").write_text("\n".join(LOG), encoding="utf-8")
 
 
